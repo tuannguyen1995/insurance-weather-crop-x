@@ -4,11 +4,10 @@ from dataclasses import dataclass
 import json
 
 
-if not hasattr(gl, "UserError"):
-    try:
-        gl.UserError = gl.vm.UserError
-    except Exception:
-        pass
+try:
+    gl.UserError = gl.vm.UserError
+except Exception:
+    pass
 
 
 def _addr_str(addr: Address) -> str:
