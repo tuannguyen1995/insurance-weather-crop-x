@@ -12,7 +12,7 @@
 
 The **InsuranceWeatherCropX** Intelligent Contract is deployed, finalized, and verified on GenLayer **studionet**:
 
-- **CONTRACT_ADDRESS:** `0xb53d1193d3cd1b7B9027ACf704B1eD9307f6F86A`
+- **CONTRACT_ADDRESS:** `0xC5754deD626249aCA3C4b702b6A9566238214684`
 - **TRANSACTION_HASH:** `0x95c6a15bfcecc9b74b354e0c4f04658574a9323b90ed94925955feb6cb913f15`
 - **DEPLOYER_ADDRESS:** `0x3c0a2c165288127b78B426c942B286C748f5E39e`
 - **NETWORK:** `studionet` (Chain ID: `61999` / `0xF1EF`)
