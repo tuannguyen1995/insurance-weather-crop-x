@@ -32,6 +32,10 @@ def sim_installMocks(mocks: dict, vm=None):
 
     # 1. Install mocks into direct VM context if active
     if vm is not None:
+        if hasattr(vm, "_web_mocks"):
+            vm._web_mocks = []
+        if hasattr(vm, "_llm_mocks"):
+            vm._llm_mocks = []
         web_mocks = mocks.get("web_mocks", {})
         for url_pattern, content in web_mocks.items():
             if isinstance(content, dict):

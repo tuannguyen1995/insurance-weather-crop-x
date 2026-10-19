@@ -12,9 +12,9 @@
 
 The **InsuranceWeatherCropX** Intelligent Contract is deployed, finalized, and verified on GenLayer **studionet**:
 
-- **CONTRACT_ADDRESS:** `0x7315b8c5F0DC2f1edD893a19e620376dB0a43140`
-- **TRANSACTION_HASH:** `0x8784664307bf7189569923104386b1d5d8ee1ff09205605853752e4e201bb92b`
-- **DEPLOYER_ADDRESS:** `0xDffe31488277e8cAF6F241766012F71608Af1557`
+- **CONTRACT_ADDRESS:** `0xb53d1193d3cd1b7B9027ACf704B1eD9307f6F86A`
+- **TRANSACTION_HASH:** `0x95c6a15bfcecc9b74b354e0c4f04658574a9323b90ed94925955feb6cb913f15`
+- **DEPLOYER_ADDRESS:** `0x3c0a2c165288127b78B426c942B286C748f5E39e`
 - **NETWORK:** `studionet` (Chain ID: `61999` / `0xF1EF`)
 - **RPC_URL:** `https://studio.genlayer.com/api`
 - **RECEIPT_STATUS:** `5` (FINALIZED)
@@ -87,7 +87,8 @@ def validator_fn(leader_res) -> bool:
 |---|---|---|
 | `TOTAL_LOSS_TRIGGERED` | Meteorological records prove extreme catastrophic disaster conditions meeting or exceeding trigger threshold (e.g., continuous 0mm rain > 30 days, or rainfall > 400mm in 48h). | **100% Coverage + Premium Refunded to Farmer** (`policy.coverage_amount + policy.premium_paid`), **0 GEN to Insurer** |
 | `PARTIAL_LOSS_TRIGGERED` | Severe weather occurred near or touching the threshold, causing substantial localized crop yield reduction. | **50% Coverage + Premium to Farmer**, **50% Coverage Returned to Insurer** |
-| `NORMAL_CONDITIONS` | Meteorological parameters stayed within normal seasonal variance; threshold was not breached, or endpoint returned 404/offline. | **0 GEN to Farmer**, **100% Coverage + Earned Premium to Insurer** |
+| `NORMAL_CONDITIONS` | Meteorological observation confirms weather parameters stayed within normal seasonal variance; threshold was not breached. | **0 GEN to Farmer**, **100% Coverage + Earned Premium to Insurer** |
+| `EVIDENCE_UNAVAILABLE` | Weather data endpoint is offline, blank (< 15 chars), 404/error, or LLM output unparseable. | **NON-SETTLING FAILURE PATH:** Policy remains **`ACTIVE`**, **0 GEN disbursed** to anyone, 100% of escrow funds safely preserved for retry. |
 
 ### 2. Canonical Weather Domain Whitelist
 To prevent malicious actors from providing fraudulent weather endpoints or spoofing precipitation data, the contract enforces a strict host whitelist:
@@ -114,8 +115,11 @@ To prevent malicious actors from providing fraudulent weather endpoints or spoof
 - **`pay_premium(policy_id: str) -> None`** `[PAYABLE]`  
   Designated farmer pays their required insurance premium deposit to activate coverage monitoring.
   
+- **`update_weather_data_url(policy_id: str, new_weather_data_url: str) -> None`**  
+  Allows insurer or farmer to update the weather data URL if an original endpoint is permanently decommissioned or migrated. Verifies canonical domain whitelist. Preserves policy in `ACTIVE` state for safe retry.
+
 - **`adjudicate_weather_claim(policy_id: str) -> None`**  
-  Callable once `policy_end` timestamp is reached. Initiates GenLayer validator web scraping of official weather data, invokes the autonomous LLM jury, reaches discrete consensus, and disburses payouts immediately.
+  Callable once `policy_end` timestamp is reached. Initiates GenLayer validator web scraping of official weather data, invokes the autonomous LLM jury, reaches discrete consensus, and disburses payouts immediately. If weather evidence is unavailable or unparseable, preserves policy and funds in `ACTIVE` status without settling.
 
 - **`cancel_unactivated_policy(policy_id: str) -> None`**  
   Safe insurer recovery path: If a farmer fails to deposit premium, the underwriter can cancel the unactivated policy and reclaim 100% of their locked coverage.

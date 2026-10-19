@@ -19,23 +19,21 @@ def _addr_str(addr: Address) -> str:
 
 
 def _get_sender() -> Address:
-    """Safely obtain transaction sender across GenVM runtime versions with static schema fallback."""
+    """Safely obtain transaction sender across GenVM runtime versions."""
     try:
-        if hasattr(gl, "message"):
-            if hasattr(gl.message, "sender"):
-                return gl.message.sender
-            if hasattr(gl.message, "sender_address"):
-                return gl.message.sender_address
+        return gl.message.sender
     except Exception:
-        pass
-    try:
-        if hasattr(gl, "message_raw") and isinstance(gl.message_raw, dict):
-            sender_raw = gl.message_raw.get("from") or gl.message_raw.get("sender")
-            if sender_raw:
-                return Address(str(sender_raw))
-    except Exception:
-        pass
-    return Address("0x0000000000000000000000000000000000000000")
+        try:
+            return gl.message.sender_address
+        except Exception:
+            try:
+                if hasattr(gl, "message_raw") and isinstance(gl.message_raw, dict):
+                    sender_raw = gl.message_raw.get("from") or gl.message_raw.get("sender")
+                    if sender_raw:
+                        return Address(str(sender_raw))
+            except Exception:
+                pass
+            raise gl.UserError("Cannot resolve sender address.")
 
 
 def _safe_transfer(recipient: Address, amount: bigint) -> None:
@@ -95,7 +93,7 @@ class CropPolicy:
     premium_paid: bigint        # Farmer's premium deposit
     coverage_amount: bigint     # Total insured payout locked by underwriter
     status: str                 # "ACTIVE", "SETTLED", "CANCELLED"
-    verdict: str                # "PENDING", "TOTAL_LOSS_TRIGGERED", "PARTIAL_LOSS_TRIGGERED", "NORMAL_CONDITIONS"
+    verdict: str                # "PENDING", "TOTAL_LOSS_TRIGGERED", "PARTIAL_LOSS_TRIGGERED", "NORMAL_CONDITIONS", "EVIDENCE_UNAVAILABLE"
     farmer_payout: bigint
     insurer_payout: bigint
     reason: str                 # Consensus evaluation rationale
@@ -159,7 +157,7 @@ class Contract(gl.Contract):
             return json.loads(cleaned.strip())
         except Exception as e:
             return {
-                "verdict": "NORMAL_CONDITIONS",
+                "verdict": "EVIDENCE_UNAVAILABLE",
                 "confidence": 0,
                 "reason": f"Failed to parse LLM JSON: {str(e)[:100]}"
             }
@@ -293,10 +291,41 @@ class Contract(gl.Contract):
         self.policies[policy_id] = policy
 
     @gl.public.write
+    def update_weather_data_url(self, policy_id: str, new_weather_data_url: str) -> None:
+        """
+        Allows insurer or farmer to update weather data URL if original endpoint is offline/deprecated.
+        Preserves policy for safe retry with verified meteorological domain.
+        """
+        if policy_id not in self.policies:
+            raise gl.UserError("Policy not found.")
+
+        policy = self.policies[policy_id]
+        sender = _addr_str(_get_sender())
+        if sender != _addr_str(policy.insurer) and sender != _addr_str(policy.farmer):
+            raise gl.UserError("Only policy insurer or farmer can update weather data URL.")
+
+        if policy.status != "ACTIVE":
+            raise gl.UserError("Cannot update URL for settled or cancelled policy.")
+
+        clean_url = new_weather_data_url.strip()
+        if not (clean_url.startswith("http://") or clean_url.startswith("https://")):
+            raise gl.UserError("weather_data_url must start with http:// or https://")
+
+        host = _parse_url_host(clean_url)
+        if not self.is_weather_domain_allowed(host):
+            raise gl.UserError(f"Weather domain '{host}' is not in the allowed whitelist.")
+
+        policy.weather_data_url = clean_url
+        policy.reason = f"Weather data URL updated by authorized party to host {host}. Ready for retry."
+        self.policies[policy_id] = policy
+
+    @gl.public.write
     def adjudicate_weather_claim(self, policy_id: str) -> None:
         """
         Validators scrape official weather observation data directly on-chain,
         verify weather parameters against threshold, and execute discrete settlement.
+        If weather evidence is offline, blank, 404, or unparseable, the policy remains ACTIVE
+        with zero disbursement, preserving all escrow funds for safe retry.
         """
         if policy_id not in self.policies:
             raise gl.UserError("Policy not found.")
@@ -333,9 +362,9 @@ class Contract(gl.Contract):
             lower_web = web_content[:500].lower() if web_content else ""
             if len(web_content.strip()) < 15 or "404 not found" in lower_web or "error" in lower_web:
                 return {
-                    "verdict": "NORMAL_CONDITIONS",
-                    "confidence": 100,
-                    "reason": "Weather data endpoint is offline, blank, or returned 404."
+                    "verdict": "EVIDENCE_UNAVAILABLE",
+                    "confidence": 0,
+                    "reason": "Weather observation endpoint is offline, blank, or returned 404/error."
                 }
 
             snippet = web_content[:4000]
@@ -357,12 +386,13 @@ OBSERVED METEOROLOGICAL OBSERVATION DATA:
 DISCRETE CLASSIFICATION RULES:
 - "TOTAL_LOSS_TRIGGERED": Observation data clearly confirms extreme disaster conditions meeting or exceeding the trigger threshold (e.g. continuous severe drought with 0 rainfall or extreme flood volume), destroying seasonal crops.
 - "PARTIAL_LOSS_TRIGGERED": Severe weather occurred near or partially touching the threshold, causing substantial localized yield reduction.
-- "NORMAL_CONDITIONS": Weather parameters stayed within normal seasonal variance; threshold was not breached.
+- "NORMAL_CONDITIONS": Observation data clearly confirms weather parameters stayed within normal seasonal variance; threshold was not breached.
+- "EVIDENCE_UNAVAILABLE": Meteorological observation data is corrupted, contradictory, incomplete, or unparseable.
 
 OUTPUT FORMAT:
 Respond ONLY with a VALID JSON object (no markdown, no backticks):
 {{
-  "verdict": "TOTAL_LOSS_TRIGGERED" | "PARTIAL_LOSS_TRIGGERED" | "NORMAL_CONDITIONS",
+  "verdict": "TOTAL_LOSS_TRIGGERED" | "PARTIAL_LOSS_TRIGGERED" | "NORMAL_CONDITIONS" | "EVIDENCE_UNAVAILABLE",
   "confidence": <integer from 0 to 100>,
   "reason": "<concise explanation max 220 characters>"
 }}"""
@@ -385,10 +415,10 @@ Respond ONLY with a VALID JSON object (no markdown, no backticks):
                         cleaned = cleaned[:-3]
                     parsed = json.loads(cleaned.strip())
 
-                verdict_candidate = str(parsed.get("verdict", "NORMAL_CONDITIONS")).strip().upper()
-                valid_verdicts = ("TOTAL_LOSS_TRIGGERED", "PARTIAL_LOSS_TRIGGERED", "NORMAL_CONDITIONS")
+                verdict_candidate = str(parsed.get("verdict", "EVIDENCE_UNAVAILABLE")).strip().upper()
+                valid_verdicts = ("TOTAL_LOSS_TRIGGERED", "PARTIAL_LOSS_TRIGGERED", "NORMAL_CONDITIONS", "EVIDENCE_UNAVAILABLE")
                 if verdict_candidate not in valid_verdicts:
-                    verdict_candidate = "NORMAL_CONDITIONS"
+                    verdict_candidate = "EVIDENCE_UNAVAILABLE"
 
                 try:
                     conf = int(parsed.get("confidence", 0))
@@ -405,7 +435,7 @@ Respond ONLY with a VALID JSON object (no markdown, no backticks):
                 }
             except Exception as e:
                 return {
-                    "verdict": "NORMAL_CONDITIONS",
+                    "verdict": "EVIDENCE_UNAVAILABLE",
                     "confidence": 0,
                     "reason": f"Audit execution error: {str(e)[:100]}"
                 }
@@ -417,7 +447,7 @@ Respond ONLY with a VALID JSON object (no markdown, no backticks):
             if not isinstance(leader, dict) or "verdict" not in leader:
                 return False
 
-            valid_verdicts = ("TOTAL_LOSS_TRIGGERED", "PARTIAL_LOSS_TRIGGERED", "NORMAL_CONDITIONS")
+            valid_verdicts = ("TOTAL_LOSS_TRIGGERED", "PARTIAL_LOSS_TRIGGERED", "NORMAL_CONDITIONS", "EVIDENCE_UNAVAILABLE")
             l_verdict = str(leader.get("verdict", "")).strip().upper()
             if l_verdict not in valid_verdicts:
                 return False
@@ -434,12 +464,22 @@ Respond ONLY with a VALID JSON object (no markdown, no backticks):
         else:
             final_res = self._parse_llm_json(str(adjudication_res))
 
-        verdict = str(final_res.get("verdict", "NORMAL_CONDITIONS")).strip().upper()
-        valid_verdicts = ("TOTAL_LOSS_TRIGGERED", "PARTIAL_LOSS_TRIGGERED", "NORMAL_CONDITIONS")
+        verdict = str(final_res.get("verdict", "EVIDENCE_UNAVAILABLE")).strip().upper()
+        valid_verdicts = ("TOTAL_LOSS_TRIGGERED", "PARTIAL_LOSS_TRIGGERED", "NORMAL_CONDITIONS", "EVIDENCE_UNAVAILABLE")
         if verdict not in valid_verdicts:
-            verdict = "NORMAL_CONDITIONS"
+            verdict = "EVIDENCE_UNAVAILABLE"
 
         reason = str(final_res.get("reason", "Consensus concluded."))
+
+        if verdict == "EVIDENCE_UNAVAILABLE":
+            # Explicit Non-Settling Failure Path:
+            # Weather observation evidence was unavailable, blank, 404, or unparseable.
+            # DO NOT settle the policy. DO NOT transfer any funds to the insurer.
+            # Preserve policy in ACTIVE status so it can be safely retried.
+            policy.verdict = "EVIDENCE_UNAVAILABLE"
+            policy.reason = f"Adjudication non-settling: {reason}. Policy and funds preserved for safe retry."
+            self.policies[policy_id] = policy
+            return
 
         policy.status = "SETTLED"
         policy.verdict = verdict

@@ -458,7 +458,7 @@ def test_adjudicate_normal_conditions(contract, direct_vm, direct_alice, direct_
     assert "normal seasonal range" in p["reason"]
 
 
-def test_adjudicate_offline_or_404_fallback(contract, direct_vm, direct_alice, direct_bob):
+def test_adjudicate_offline_or_404_preserves_policy_for_retry(contract, direct_vm, direct_alice, direct_bob):
     from datetime import datetime, timezone, timedelta
     t_start = datetime(2026, 10, 15, 12, 0, 0, tzinfo=timezone.utc)
     direct_vm.warp(t_start.isoformat())
@@ -480,7 +480,7 @@ def test_adjudicate_offline_or_404_fallback(contract, direct_vm, direct_alice, d
 
     direct_vm.warp((t_start + timedelta(days=21)).isoformat())
 
-    # Web mock returns 404
+    # 1. Weather observation endpoint is offline (returns 404)
     sim_installMocks({
         "web_mocks": {
             ".*weather.gov.*": {
@@ -493,8 +493,71 @@ def test_adjudicate_offline_or_404_fallback(contract, direct_vm, direct_alice, d
     contract.adjudicate_weather_claim(pid)
 
     p = json.loads(contract.get_policy(pid))
-    assert p["status"] == "SETTLED"
-    assert p["verdict"] == "NORMAL_CONDITIONS"
-    assert "offline, blank, or returned 404" in p["reason"]
-    assert p["insurer_payout"] == "5500"
+    # CRITICAL: Must NOT settle to NORMAL_CONDITIONS and must NOT transfer funds to insurer!
+    assert p["status"] == "ACTIVE"
+    assert p["verdict"] == "EVIDENCE_UNAVAILABLE"
+    assert p["insurer_payout"] == "0"
     assert p["farmer_payout"] == "0"
+    assert "safe retry" in p["reason"]
+
+    # 2. Safe Retry Path: Weather endpoint comes back online with extreme disaster data
+    sim_installMocks({
+        "web_mocks": {
+            ".*weather.gov.*": {
+                "status": 200,
+                "body": "Official restored observation record for STATION-OFFLINE-01: 28 consecutive days with 0mm rain. Severe drought confirmed."
+            }
+        },
+        "llm_mocks": {
+            ".*": {
+                "verdict": "TOTAL_LOSS_TRIGGERED",
+                "confidence": 98,
+                "reason": "Restored data confirms severe drought breaching threshold."
+            }
+        }
+    }, vm=direct_vm)
+
+    # Calling adjudication again succeeds because policy remained ACTIVE
+    contract.adjudicate_weather_claim(pid)
+
+    p_settled = json.loads(contract.get_policy(pid))
+    assert p_settled["status"] == "SETTLED"
+    assert p_settled["verdict"] == "TOTAL_LOSS_TRIGGERED"
+    assert p_settled["farmer_payout"] == "5500"
+    assert p_settled["insurer_payout"] == "0"
+
+
+def test_update_weather_data_url(contract, direct_vm, direct_alice, direct_bob, direct_charlie):
+    direct_vm.sender = direct_bob
+    direct_vm.value = 3000
+    pid = contract.create_policy(
+        farmer=direct_alice,
+        risk_type="FLOOD",
+        station_id="STATION-BACKUP-01",
+        trigger_threshold="Rainfall > 300mm in 24 hours",
+        weather_data_url="https://api.open-meteo.com/v1/forecast",
+        policy_duration_sec=86400 * 10
+    )
+
+    # 1. Unauthorized third party cannot update URL
+    direct_vm.sender = direct_charlie
+    with pytest.raises(Exception, match="Only policy insurer or farmer can update weather data URL"):
+        contract.update_weather_data_url(pid, "https://api.weather.gov/stations/backup")
+
+    # 2. Non-whitelisted domain rejected
+    direct_vm.sender = direct_alice
+    with pytest.raises(Exception, match="is not in the allowed whitelist"):
+        contract.update_weather_data_url(pid, "https://fake-weather-news.org/data")
+
+    # 3. Farmer updates to valid alternative meteorological station
+    contract.update_weather_data_url(pid, "https://api.weather.gov/stations/BACKUP01/observations")
+    p = json.loads(contract.get_policy(pid))
+    assert p["weather_data_url"] == "https://api.weather.gov/stations/BACKUP01/observations"
+    assert "Weather data URL updated by authorized party" in p["reason"]
+
+    # 4. Insurer updates to another valid observation endpoint
+    direct_vm.sender = direct_bob
+    contract.update_weather_data_url(pid, "https://ecmwf.int/forecasts/backup01")
+    p2 = json.loads(contract.get_policy(pid))
+    assert p2["weather_data_url"] == "https://ecmwf.int/forecasts/backup01"
+
